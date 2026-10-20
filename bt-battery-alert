@@ -21,7 +21,8 @@ from dbus.mainloop.glib import DBusGMainLoop
 import gi
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import GLib, Pango, PangoCairo
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib, Pango, PangoCairo
 
 try:
     from gi.repository import GLibUnix
@@ -165,8 +166,8 @@ def hex_color(rgb):
     return "#" + "".join(f"{round(c * 255):02x}" for c in rgb)
 
 
-def icon_svg(name, x, size, rgb):
-    """An Adwaita symbolic icon's shapes, recoloured and placed at (x, 0)."""
+def icon_svg(name, x, size, rgb, y=0):
+    """An Adwaita symbolic icon's shapes, recoloured and placed at (x, y)."""
     path = find_icon(name) or find_icon(DEFAULT_ICON)
     if not path:
         return ""
@@ -176,7 +177,26 @@ def icon_svg(name, x, size, rgb):
         if el.get("fill") not in (None, "none"):
             el.set("fill", hex_color(rgb))  # fill-opacity stays: it dims parts
     shapes = "".join(ET.tostring(child, encoding="unicode") for child in root)
-    return f'<g transform="translate({x:g} 0) scale({size / 16:g})">{shapes}</g>'
+    return f'<g transform="translate({x:g} {y:g}) scale({size / 16:g})">{shapes}</g>'
+
+
+def text_ink(desc, text):
+    """Ink rectangle (x, y, width, height) and baseline of `text`, in pixels."""
+    layout = Pango.Layout.new(PangoCairo.FontMap.get_default().create_context())
+    layout.set_font_description(desc)
+    layout.set_text(text, -1)
+    ink = layout.get_extents()[0]
+    return (*(v / Pango.SCALE for v in (ink.x, ink.y, ink.width, ink.height)),
+            layout.get_baseline() / Pango.SCALE)
+
+
+def text_svg(desc, text, left, top, rgb, scale=1.0):
+    """`text` in the panel font with its ink's top-left corner at (left, top)."""
+    ix, iy, _, _, baseline = text_ink(desc, text)
+    px = desc.get_size() / Pango.SCALE * scale
+    return (f'<text x="{left - ix * scale:g}" y="{top + (baseline - iy) * scale:g}" '
+            f'font-family={quoteattr(desc.get_family())} font-weight="bold" '
+            f'font-size="{px:g}px" fill="{hex_color(rgb)}">{text}</text>')
 
 
 def render_strip(height, entries):
@@ -190,11 +210,6 @@ def render_strip(height, entries):
     inner, gap = 0.25 * h, 0.6 * h  # icon-to-number, around dividers
     entries = entries or [(DEFAULT_ICON, None, None)]
     desc = panel_font()
-    family = desc.get_family()
-    px = desc.get_size() / Pango.SCALE
-    layout = Pango.Layout.new(PangoCairo.FontMap.get_default().create_context())
-    layout.set_font_description(desc)
-
     body, x = [], 0.0
     for n, (icon, percent, rgb) in enumerate(entries):
         if n:
@@ -208,19 +223,58 @@ def render_strip(height, entries):
             continue
         # Measure the digits' ink, so they sit exactly `inner` from the icon
         # and centred on its height.
-        layout.set_text(str(percent), -1)
-        ink = layout.get_extents()[0]
-        ix, iy = ink.x / Pango.SCALE, ink.y / Pango.SCALE
-        iw, ih = ink.width / Pango.SCALE, ink.height / Pango.SCALE
-        baseline = layout.get_baseline() / Pango.SCALE
-        body.append(
-            f'<text x="{x + inner - ix:g}" y="{(h - ih) / 2 - iy + baseline:g}" '
-            f'font-family={quoteattr(family)} font-weight="bold" font-size="{px:g}px" '
-            f'fill="{hex_color(rgb)}">{percent}</text>')
+        _, _, iw, ih, _ = text_ink(desc, str(percent))
+        body.append(text_svg(desc, str(percent), x + inner, (h - ih) / 2, rgb))
         x += inner + iw
     width = math.ceil(max(x, 1.5 * h))  # at least 1.5:1, so the shell keeps it wide
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{h}" '
             f'viewBox="0 0 {width} {h}">{"".join(body)}</svg>')
+
+
+def render_square(icon, percent, rgb):
+    """One device as a square SVG, 16 units: its icon above its charge number.
+    For trays that only show square icons."""
+    rgb = rgb or WHITE
+    desc = panel_font()
+    text = str(percent)
+    _, _, iw, ih, _ = text_ink(desc, text)
+    k = min(6.5 / ih, 15 / iw)  # digits fill the lower band, capped at the width
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
+            'viewBox="0 0 16 16">'
+            + icon_svg(icon, 3.5, 9, rgb)
+            + text_svg(desc, text, (16 - iw * k) / 2, 9.5 + (6.5 - ih * k) / 2, rgb, k)
+            + "</svg>")
+
+
+def svg_to_argb(svg, size):
+    """Rasterise SVG at size x size; return big-endian ARGB32, as SNI wants."""
+    loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+    loader.set_size(size, size)
+    loader.write(svg.encode())
+    loader.close()
+    pb = loader.get_pixbuf()
+    if not pb.get_has_alpha():
+        pb = pb.add_alpha(False, 0, 0, 0)
+    pixels, stride = pb.get_pixels(), pb.get_rowstride()
+    out = bytearray()
+    for row in range(size):
+        rgba = pixels[row * stride:row * stride + size * 4]
+        argb = bytearray(len(rgba))
+        argb[0::4], argb[1::4], argb[2::4], argb[3::4] = (
+            rgba[3::4], rgba[0::4], rgba[1::4], rgba[2::4])
+        out += argb
+    return bytes(out)
+
+
+def process_name(session, bus_name):
+    """Executable name of the process that owns `bus_name`, or ''."""
+    try:
+        dbus_obj = session.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+        pid = dbus_obj.GetConnectionUnixProcessID(bus_name, dbus_interface="org.freedesktop.DBus")
+        with open(f"/proc/{int(pid)}/comm") as f:
+            return f.read().strip()
+    except (dbus.DBusException, OSError):
+        return ""
 
 
 def remove_file(path):
@@ -329,21 +383,27 @@ class Menu(dbus.service.Object):
 
 
 class TrayItem(dbus.service.Object):
-    """The tray icon: every device's icon and charge, side by side.
+    """A tray icon. On GNOME it is one strip with every device's icon and
+    charge side by side; on other desktops there is one square icon per
+    device (`dev`), since their trays fit icons into a square.
 
-    The image goes out as an SVG file named in IconName rather than as
+    The strip goes out as an SVG file named in IconName rather than as
     IconPixmap, because GNOME's AppIndicator extension squeezes pixmaps into a
-    square but shows a wide image file at its own size."""
+    square but shows a wide image file at its own size, rendered sharp at the
+    screen's scale. The square icons are plain pixmaps, which every tray takes."""
 
     HEIGHT = 16  # GNOME's panel icon size
+    SIZES = (16, 22, 24, 32, 48, 64, 96, 128)
 
-    def __init__(self, app):
+    def __init__(self, app, dev=None):
         self.conn = dbus.SessionBus(private=True)
         super().__init__(self.conn, "/StatusNotifierItem")
         self.app = app
+        self.dev = dev
         self.menu = Menu(self.conn, app)
         self.icon_dir = os.path.join(GLib.get_user_runtime_dir(), APP_ID)
         self.icon_file = ""
+        self.pixmaps = dbus.Array([], signature="(iiay)")
         self.serial = 0
         self.shown = None  # entries the current image shows
         self._render()
@@ -358,16 +418,27 @@ class TrayItem(dbus.service.Object):
             reply_handler=lambda: None,
             error_handler=lambda e: print(f"tray: register failed: {e}", file=sys.stderr))
 
+    def _devices(self):
+        return [self.dev] if self.dev else self.app.sorted_devices()
+
     def _render(self):
         """Redraw the image if what it shows changed; return whether it did."""
         a = self.app.args
         entries = []
-        for dev in self.app.sorted_devices():
+        for dev in self._devices():
             color = level_color(dev.percent, a.threshold, a.critical, dev.charging)
             entries.append((ICONS.get(dev.kind, DEFAULT_ICON), dev.percent, color))
         if entries == self.shown:
             return False
         self.shown = entries
+        if self.dev:
+            svg = render_square(*entries[0])
+            self.pixmaps = dbus.Array(
+                [dbus.Struct((dbus.Int32(n), dbus.Int32(n), dbus.ByteArray(svg_to_argb(svg, n))),
+                             signature="iiay")
+                 for n in self.SIZES],
+                signature="(iiay)")
+            return True
         # A fresh name every time, since the shell caches images by file.
         os.makedirs(self.icon_dir, exist_ok=True)
         self.serial += 1
@@ -379,7 +450,8 @@ class TrayItem(dbus.service.Object):
             GLib.timeout_add_seconds(10, remove_file, old)
         return True
 
-    def update(self):
+    def update(self, dev=None):
+        self.dev = dev
         if self._render():
             self.NewIcon()
         self.NewTitle()
@@ -392,33 +464,40 @@ class TrayItem(dbus.service.Object):
         self.menu.remove_from_connection()
         self.remove_from_connection()
         self.conn.close()
-        remove_file(self.icon_file)
+        if self.icon_file:
+            remove_file(self.icon_file)
 
     def _status(self):
         t = self.app.args.threshold
-        low = any(not d.charging and d.percent <= t for d in self.app.devices.values())
+        low = any(not d.charging and d.percent <= t for d in self._devices())
         return "NeedsAttention" if low else "Active"
 
     def _props(self):
         no_pixmap = dbus.Array([], signature="(iiay)")
-        devices = self.app.sorted_devices()
-        body = "\n".join(f"{d.kind} — {d.summary()}" for d in devices) or "No Bluetooth batteries"
+        dev = self.dev
+        if dev:
+            title = dev.name
+            body = f"{dev.kind} · {dev.percent}%" + (" · charging" if dev.charging else "")
+        else:
+            title = APP_NAME
+            body = ("\n".join(f"{d.kind} — {d.summary()}" for d in self._devices())
+                    or "No Bluetooth batteries")
         return dbus.Dictionary({
             "Category": "Hardware",
-            "Id": APP_ID,
-            "Title": APP_NAME,
+            "Id": f"{APP_ID}-{dev.key}" if dev else APP_ID,
+            "Title": dev.summary() if dev else APP_NAME,
             "Status": self._status(),
             "WindowId": dbus.Int32(0),
             "IconName": self.icon_file,
-            "IconPixmap": no_pixmap,
+            "IconPixmap": self.pixmaps,
             "AttentionIconName": self.icon_file,
-            "AttentionIconPixmap": no_pixmap,
+            "AttentionIconPixmap": self.pixmaps,
             "OverlayIconName": "",
             "OverlayIconPixmap": no_pixmap,
             "IconThemePath": "",
             "ItemIsMenu": True,
             "Menu": dbus.ObjectPath("/MenuBar"),
-            "ToolTip": dbus.Struct(("", no_pixmap, APP_NAME, body), signature="sa(iiay)ss"),
+            "ToolTip": dbus.Struct(("", no_pixmap, title, body), signature="sa(iiay)ss"),
         }, signature="sv")
 
     @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
@@ -522,7 +601,8 @@ class App:
         self.session = dbus.SessionBus()
         self.notifier = Notifier(self.session)
         self.devices = {}  # UPower path -> Device
-        self.tray = None
+        self.trays = {}  # "" -> the GNOME strip, or UPower path -> square icon
+        self.gnome_tray = False
         self.alerted = {}  # device key -> lowest level already alerted for
         self.trends = {}  # device key -> [low, high, charging] for inference
 
@@ -531,6 +611,23 @@ class App:
                                             UPOWER, UPOWER_PATH)
         self.system.add_signal_receiver(self._on_props, "PropertiesChanged", PROPS,
                                         UPOWER, path_keyword="path")
+        if not args.no_tray and not args.list:
+            try:  # decide up front, so the first icons drawn are the right kind
+                self.gnome_tray = self._is_gnome(self.session.get_name_owner(SNW))
+            except dbus.DBusException:  # no tray yet
+                pass
+            self.session.watch_name_owner(SNW, self._on_tray_host)
+
+    def _is_gnome(self, owner):
+        # GNOME's AppIndicator extension runs inside gnome-shell and is the
+        # only tray known to show a wide icon; others get square ones.
+        return bool(owner) and process_name(self.session, owner) == "gnome-shell"
+
+    def _on_tray_host(self, owner):
+        gnome = self._is_gnome(owner)
+        if gnome != self.gnome_tray:
+            self.gnome_tray = gnome
+            self.sync()
 
     def _on_props(self, iface, changed, invalidated, path=None):
         if iface == UPOWER_DEVICE and path != UPOWER_PATH:
@@ -563,12 +660,16 @@ class App:
         for dev in self.devices.values():
             self.infer_charging(dev)
 
-        if self.args.no_tray:
-            pass
-        elif self.tray:
-            self.tray.update()
-        else:
-            self.tray = TrayItem(self)
+        if not self.args.no_tray:
+            wanted = {"": None} if self.gnome_tray else dict(self.devices)
+            for key in list(self.trays):
+                if key not in wanted:
+                    self.trays.pop(key).close()
+            for key, dev in wanted.items():
+                if key in self.trays:
+                    self.trays[key].update(dev)
+                else:
+                    self.trays[key] = TrayItem(self, dev)
 
         for dev in self.devices.values():
             self.check_alert(dev)
@@ -616,8 +717,8 @@ class App:
         for sig in (signal.SIGINT, signal.SIGTERM):
             unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
         self.loop.run()
-        if self.tray:
-            self.tray.close()
+        for tray in self.trays.values():
+            tray.close()
 
 
 def main():

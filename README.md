@@ -6,14 +6,16 @@ Low-battery notifications and tray icons for Bluetooth devices on Linux.
   <img src="screenshot.png" width="410" alt="Tray icon showing a headset at 100%, a keyboard at 87% and a mouse at 74%, with its menu open">
 </p>
 
-- One wide tray icon for all your Bluetooth devices, side by side: the
-  Adwaita icon for each device type (mouse, keyboard, headset, headphones,
-  speakers, game controller, phone, or the Bluetooth symbol for anything
-  else) followed by its charge number in the top bar's font. A device's icon
-  and number are white when healthy, orange at or below the alert threshold, red
-  at or below the critical level (half the threshold), and blue while
-  charging, in soft GNOME palette tones. Click the icon to see every
-  device's level, plus a Quit item.
+- Tray icons showing each device's charge, with the Adwaita icon for its
+  type (mouse, keyboard, headset, headphones, speakers, game controller,
+  phone, or the Bluetooth symbol for anything else) and the number in the
+  top bar's font. On GNOME, all devices share one wide icon, side by side;
+  on other desktops each device gets its own square icon, with the number
+  under the device icon (see [Tray support](#tray-support)). A device's icon
+  and number are white when healthy, orange at or below the alert
+  threshold, red at or below the critical level (half the threshold), and
+  blue while charging, in soft GNOME palette tones. Click an icon to see
+  every device's level, plus a Quit item.
 - A desktop notification in the style of the system's low-battery warning
   ("Mouse battery low — Toad One is low on power (34%)") when a device reaches
   40%, and a second, critical one at 20%. A notification is replaced in place
@@ -33,9 +35,9 @@ directly: no libappindicator needed.
 
 ## Requirements
 
-Python 3 with `python3-gobject`, `python3-dbus` and `python3-cairo`, plus
-`upower`, `bluez`, `librsvg2`, `pango` and `adwaita-icon-theme`. Fedora ships all of these in a standard Workstation
-install.
+Python 3 with `python3-gobject` and `python3-dbus`, plus `upower`, `bluez`,
+`pango`, `gdk-pixbuf2`, `librsvg2` and `adwaita-icon-theme`. Fedora ships
+all of these in a standard Workstation install.
 
 **GNOME** has no tray of its own. Install and enable the AppIndicator
 extension to see the icons (notifications work without it):
@@ -44,11 +46,25 @@ extension to see the icons (notifications work without it):
     # log out and back in, then:
     gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
 
-KDE Plasma, XFCE, Cinnamon, Budgie and waybar/swaybar tray hosts work
-out of the box. The icon is handed to the tray as a wide SVG file (in
-`$XDG_RUNTIME_DIR/bt-battery-alert/`), which GNOME's AppIndicator extension
-shows at full width and draws sharp at any display scale; trays that force
-icons to a square shrink it to fit.
+KDE Plasma, XFCE, Cinnamon, Budgie and waybar/swaybar have a tray built in.
+
+### Tray support
+
+The layout is picked from whichever program hosts the tray, and switches
+if that changes while running:
+
+- **GNOME** (AppIndicator extension): one wide icon with every device side
+  by side. It is handed over as an SVG file in
+  `$XDG_RUNTIME_DIR/bt-battery-alert/`, which the extension shows at full
+  width and draws sharp at any display scale.
+- **Everything else**: one square icon per device, the device icon above its
+  number, sent as plain image data at several sizes. Every
+  StatusNotifierItem tray accepts this, though it is a small bitmap rather
+  than vector art.
+
+Only the GNOME layout has been tried on a real desktop. The square icons
+are built to the standard and checked by forcing them on GNOME, but not
+yet on KDE, XFCE or waybar.
 
 ## Use
 
