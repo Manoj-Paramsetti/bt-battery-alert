@@ -2,17 +2,18 @@
 
 Low-battery notifications and tray icons for Bluetooth devices on Linux.
 
-![Tray icon showing a keyboard at 67% and a mouse at 96%, with its menu open](screenshot.png)
+![Tray icon showing a headset at 90%, a keyboard at 85% and a mouse at 74%, with its menu open](screenshot.png)
 
 - One wide tray icon for all your Bluetooth devices, side by side: a glyph
   for each device type (mouse, keyboard, headphones, or the Bluetooth symbol
   for anything else) followed by its charge number. A device's glyph and
-  number are white when healthy and turn orange at or below the threshold,
-  red at or below the critical level, and blue while charging. Click the icon
-  to see every device's level, plus a Quit item.
+  number are white when healthy, orange at or below the alert threshold, red
+  at or below the critical level (half the threshold), and blue while
+  charging, in soft GNOME palette tones. Click the icon to see every
+  device's level, plus a Quit item.
 - A desktop notification in the style of the system's low-battery warning
   ("Mouse battery low — Toad One is low on power (34%)") when a device reaches
-  40%, and a second, critical one at 10%. A notification is replaced in place
+  40%, and a second, critical one at 20%. A notification is replaced in place
   rather than stacked, and is withdrawn when the device charges. A device has
   to recover to threshold + 5% or start charging before it can alert again.
 
@@ -55,7 +56,7 @@ shows at full width; trays that force icons to a square shrink it to fit.
 Options:
 
     -t, --threshold N    alert at or below N% (default 40)
-    -c, --critical N     second, critical alert at or below N% (default 10)
+    -c, --critical N     second, critical alert at or below N% (default half of -t)
     -i, --interval S     full re-read every S seconds, besides UPower signals (default 60)
     --no-tray            notifications only
     --all-peripherals    include non-Bluetooth wireless peripherals (USB receivers etc.)
