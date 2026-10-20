@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Bluetooth battery alerts and tray icons for Linux desktops.
+
+Reads battery levels of Bluetooth devices from UPower, shows one tray icon per
+device (StatusNotifierItem, drawn with the charge level), and sends a
+low-battery notification when a device drops to the alert threshold.
+"""
+
+import argparse
+import re
+import signal
+import sys
+
+import cairo
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+try:
+    from gi.repository import GLibUnix
+    unix_signal_add = GLibUnix.signal_add
+except ImportError:  # PyGObject < 3.52
+    unix_signal_add = GLib.unix_signal_add
+
+APP_ID = "bt-battery-alert"
+APP_NAME = "Bluetooth Battery"
+
+UPOWER = "org.freedesktop.UPower"
+UPOWER_PATH = "/org/freedesktop/UPower"
+UPOWER_DEVICE = "org.freedesktop.UPower.Device"
+PROPS = "org.freedesktop.DBus.Properties"
+SNI = "org.kde.StatusNotifierItem"
+SNW = "org.kde.StatusNotifierWatcher"
+DBUSMENU = "com.canonical.dbusmenu"
+
+# UPower device types; anything not listed is reported as "Device".
+KINDS = {
+    5: "Mouse", 6: "Keyboard", 7: "PDA", 8: "Phone", 9: "Media player",
+    10: "Tablet", 11: "Computer", 12: "Game controller", 13: "Pen",
+    14: "Touchpad", 17: "Headset", 18: "Speakers", 19: "Headphones",
+    22: "Remote control", 26: "Wearable", 27: "Toy",
+}
+POWER_SOURCES = {1, 2, 3}  # line power, laptop battery, UPS
+CHARGING_STATES = {1, 4, 5}  # charging, fully charged, pending charge
+MAC_RE = re.compile(r"([0-9a-f]{2}[:_]){5}[0-9a-f]{2}", re.I)
+
+# Hysteresis: once alerted, a device must climb this far above the threshold
+# (or start charging) before it can alert again.
+REARM_MARGIN = 5
+
+# Most Bluetooth devices only report a percentage (state "unknown"), so
+# charging is inferred: a rise of this many points from the lowest reading
+# means charging; a drop this far from the highest reading means it stopped.
+# The margin absorbs the small rebound some firmware shows after waking.
+TREND_MARGIN = 3
+
+
+class Device:
+    def __init__(self, path, props):
+        self.path = str(path)
+        self.native = str(props.get("NativePath", ""))
+        self.name = str(props.get("Model", "")) or "Bluetooth device"
+        self.kind = KINDS.get(int(props.get("Type", 0)), "Device")
+        self.percent = int(round(float(props.get("Percentage", 0))))
+        self.state = int(props.get("State", 0))
+        self.present = bool(props.get("IsPresent", True))
+        self.power_supply = bool(props.get("PowerSupply", False))
+        self.type = int(props.get("Type", 0))
+        # Serial is the MAC for Bluetooth devices; stable across reconnects.
+        self.key = str(props.get("Serial", "")) or self.native or self.path
+        self.inferred_charging = False
+
+    @property
+    def state_known(self):
+        return self.state != 0
+
+    @property
+    def charging(self):
+        return self.state in CHARGING_STATES or self.inferred_charging
+
+    def is_bluetooth(self):
+        return "/org/bluez/" in self.native or bool(MAC_RE.search(self.native))
+
+    def is_peripheral(self):
+        return not self.power_supply and self.type not in POWER_SOURCES
+
+    def summary(self):
+        status = " (charging)" if self.charging else ""
+        return f"{self.name}: {self.percent}%{status}"
+
+
+# --------------------------------------------------------------------------
+# Icon rendering
+
+
+def level_color(percent, threshold, critical, charging):
+    if charging:
+        return (0.29, 0.64, 1.0)
+    if percent <= critical:
+        return (0.93, 0.20, 0.23)
+    if percent <= threshold:
+        return (0.97, 0.62, 0.11)
+    return (0.30, 0.80, 0.40)
+
+
+def render_icon(size, percent, color):
+    """Draw the charge number above a small battery gauge, return ARGB32 bytes."""
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    cr = cairo.Context(surf)
+    s = size / 24.0
+
+    # Percentage text, shrunk to fit the icon width.
+    text = str(percent)
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    cr.set_font_size(13 * s)
+    ext = cr.text_extents(text)
+    if ext.width > 23 * s:
+        cr.set_font_size(13 * s * 23 * s / ext.width)
+        ext = cr.text_extents(text)
+    x = (size - ext.width) / 2 - ext.x_bearing
+    y = 13 * s - (ext.height + ext.y_bearing)
+    cr.move_to(x, y)
+    cr.text_path(text)
+    cr.set_source_rgba(0, 0, 0, 0.55)
+    cr.set_line_width(2 * s)
+    cr.stroke_preserve()
+    cr.set_source_rgb(1, 1, 1)
+    cr.fill()
+
+    # Battery gauge: outline, nub, and a fill proportional to the charge.
+    lw = max(1.0, 1.2 * s)
+    bx, by, bw, bh = 1.5 * s, 15 * s, 19 * s, 8 * s
+    cr.set_line_width(lw)
+    cr.rectangle(bx, by, bw, bh)
+    cr.set_source_rgb(1, 1, 1)
+    cr.stroke()
+    cr.rectangle(bx + bw, by + bh * 0.28, 2 * s, bh * 0.44)
+    cr.fill()
+    inner = bw - 2 * lw
+    fill = max(inner * min(percent, 100) / 100.0, lw)
+    cr.rectangle(bx + lw, by + lw, fill, bh - 2 * lw)
+    cr.set_source_rgb(*color)
+    cr.fill()
+
+    surf.flush()
+    return to_network_argb(surf.get_data(), surf.get_stride(), size)
+
+
+def to_network_argb(data, stride, size):
+    """Cairo gives native-endian premultiplied ARGB; SNI wants big-endian straight ARGB."""
+    little = sys.byteorder == "little"
+    out = bytearray(size * size * 4)
+    o = 0
+    for row in range(size):
+        base = row * stride
+        for i in range(base, base + size * 4, 4):
+            if little:
+                b, g, r, a = data[i], data[i + 1], data[i + 2], data[i + 3]
+            else:
+                a, r, g, b = data[i], data[i + 1], data[i + 2], data[i + 3]
+            if 0 < a < 255:
+                r, g, b = (min(255, c * 255 // a) for c in (r, g, b))
+            out[o:o + 4] = bytes((a, r, g, b))
+            o += 4
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------
+# Tray icon (StatusNotifierItem + a minimal dbusmenu)
+
+
+class Menu(dbus.service.Object):
+    QUIT_ID = 1
+
+    def __init__(self, conn, app):
+        super().__init__(conn, "/MenuBar")
+        self.app = app
+        self.revision = 1
+
+    def _item(self, item_id, props):
+        return dbus.Struct(
+            (dbus.Int32(item_id), dbus.Dictionary(props, signature="sv"),
+             dbus.Array([], signature="v")),
+            signature="ia{sv}av")
+
+    def _items(self):
+        items = []
+        for n, dev in enumerate(self.app.sorted_devices(), start=100):
+            items.append(self._item(n, {"label": f"{dev.kind} — {dev.summary()}",
+                                        "enabled": False}))
+        if not items:
+            items.append(self._item(99, {"label": "No Bluetooth batteries", "enabled": False}))
+        items.append(self._item(2, {"type": "separator"}))
+        items.append(self._item(self.QUIT_ID, {"label": "Quit"}))
+        return items
+
+    def refresh(self):
+        self.revision += 1
+        self.LayoutUpdated(self.revision, 0)
+
+    @dbus.service.method(DBUSMENU, in_signature="iias", out_signature="u(ia{sv}av)")
+    def GetLayout(self, parent_id, depth, names):
+        root = dbus.Struct(
+            (dbus.Int32(0), dbus.Dictionary({"children-display": "submenu"}, signature="sv"),
+             dbus.Array(self._items(), signature="v")),
+            signature="ia{sv}av")
+        return dbus.UInt32(self.revision), root
+
+    @dbus.service.method(DBUSMENU, in_signature="aias", out_signature="a(ia{sv})")
+    def GetGroupProperties(self, ids, names):
+        found = {int(i[0]): i[1] for i in self._items()}
+        return dbus.Array(
+            [dbus.Struct((dbus.Int32(i), found[int(i)]), signature="ia{sv}")
+             for i in ids if int(i) in found],
+            signature="(ia{sv})")
+
+    @dbus.service.method(DBUSMENU, in_signature="is", out_signature="v")
+    def GetProperty(self, item_id, name):
+        for i in self._items():
+            if int(i[0]) == item_id and name in i[1]:
+                return i[1][name]
+        return ""
+
+    @dbus.service.method(DBUSMENU, in_signature="isvu", out_signature="")
+    def Event(self, item_id, event_id, data, timestamp):
+        if event_id == "clicked" and item_id == self.QUIT_ID:
+            GLib.idle_add(self.app.quit)
+
+    @dbus.service.method(DBUSMENU, in_signature="a(isvu)", out_signature="ai")
+    def EventGroup(self, events):
+        for item_id, event_id, data, ts in events:
+            self.Event(item_id, event_id, data, ts)
+        return dbus.Array([], signature="i")
+
+    @dbus.service.method(DBUSMENU, in_signature="i", out_signature="b")
+    def AboutToShow(self, item_id):
+        return False
+
+    @dbus.service.method(DBUSMENU, in_signature="ai", out_signature="aiai")
+    def AboutToShowGroup(self, ids):
+        return dbus.Array([], signature="i"), dbus.Array([], signature="i")
+
+    @dbus.service.signal(DBUSMENU, signature="ui")
+    def LayoutUpdated(self, revision, parent):
+        pass
+
+    @dbus.service.signal(DBUSMENU, signature="a(ia{sv})a(ias)")
+    def ItemsPropertiesUpdated(self, updated, removed):
+        pass
+
+    @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
+    def Get(self, iface, name):
+        return self.GetAll(iface)[name]
+
+    @dbus.service.method(PROPS, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return dbus.Dictionary({
+            "Version": dbus.UInt32(3),
+            "TextDirection": "ltr",
+            "Status": "normal",
+            "IconThemePath": dbus.Array([], signature="s"),
+        }, signature="sv")
+
+
+class TrayItem(dbus.service.Object):
+    """One tray icon. Each lives on its own private session-bus connection,
+    because the SNI convention fixes the object path to /StatusNotifierItem."""
+
+    SIZES = (16, 22, 24, 32, 48, 64)
+
+    def __init__(self, app, dev):
+        self.conn = dbus.SessionBus(private=True)
+        super().__init__(self.conn, "/StatusNotifierItem")
+        self.app = app
+        self.menu = Menu(self.conn, app)
+        self.dev = dev
+        self.pixmaps = dbus.Array([], signature="(iiay)")
+        self._render()
+        self._watch = self.conn.watch_name_owner(SNW, self._on_watcher)
+
+    def _on_watcher(self, owner):
+        if not owner:
+            return
+        watcher = self.conn.get_object(SNW, "/StatusNotifierWatcher")
+        watcher.RegisterStatusNotifierItem(
+            self.conn.get_unique_name(), dbus_interface=SNW,
+            reply_handler=lambda: None,
+            error_handler=lambda e: print(f"tray: register failed: {e}", file=sys.stderr))
+
+    def _render(self):
+        a = self.app.args
+        color = level_color(self.dev.percent, a.threshold, a.critical, self.dev.charging)
+        self.pixmaps = dbus.Array(
+            [dbus.Struct((dbus.Int32(n), dbus.Int32(n),
+                          dbus.ByteArray(render_icon(n, self.dev.percent, color))),
+                         signature="iiay")
+             for n in self.SIZES],
+            signature="(iiay)")
+
+    def update(self, dev):
+        old, self.dev = self.dev, dev
+        if (old.percent, old.charging) != (dev.percent, dev.charging):
+            self._render()
+            self.NewIcon()
+        self.NewTitle()
+        self.NewToolTip()
+        self.NewStatus(self._status())
+        self.menu.refresh()
+
+    def close(self):
+        self._watch.cancel()
+        self.menu.remove_from_connection()
+        self.remove_from_connection()
+        self.conn.close()
+
+    def _status(self):
+        low = not self.dev.charging and self.dev.percent <= self.app.args.threshold
+        return "NeedsAttention" if low else "Active"
+
+    def _props(self):
+        dev = self.dev
+        no_pixmap = dbus.Array([], signature="(iiay)")
+        body = f"{dev.kind} · {dev.percent}%" + (" · charging" if dev.charging else "")
+        return dbus.Dictionary({
+            "Category": "Hardware",
+            "Id": f"{APP_ID}-{dev.key}",
+            "Title": dev.summary(),
+            "Status": self._status(),
+            "WindowId": dbus.Int32(0),
+            "IconName": "",
+            "IconPixmap": self.pixmaps,
+            "AttentionIconName": "",
+            "AttentionIconPixmap": self.pixmaps,
+            "OverlayIconName": "",
+            "OverlayIconPixmap": no_pixmap,
+            "IconThemePath": "",
+            "ItemIsMenu": True,
+            "Menu": dbus.ObjectPath("/MenuBar"),
+            "ToolTip": dbus.Struct(("", no_pixmap, dev.name, body), signature="sa(iiay)ss"),
+        }, signature="sv")
+
+    @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
+    def Get(self, iface, name):
+        return self._props()[name]
+
+    @dbus.service.method(PROPS, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self._props() if iface == SNI else dbus.Dictionary({}, signature="sv")
+
+    @dbus.service.method(SNI, in_signature="ii")
+    def Activate(self, x, y):
+        pass
+
+    @dbus.service.method(SNI, in_signature="ii")
+    def SecondaryActivate(self, x, y):
+        pass
+
+    @dbus.service.method(SNI, in_signature="ii")
+    def ContextMenu(self, x, y):
+        pass
+
+    @dbus.service.method(SNI, in_signature="is")
+    def Scroll(self, delta, orientation):
+        pass
+
+    @dbus.service.signal(SNI)
+    def NewIcon(self):
+        pass
+
+    @dbus.service.signal(SNI)
+    def NewAttentionIcon(self):
+        pass
+
+    @dbus.service.signal(SNI)
+    def NewTitle(self):
+        pass
+
+    @dbus.service.signal(SNI)
+    def NewToolTip(self):
+        pass
+
+    @dbus.service.signal(SNI, signature="s")
+    def NewStatus(self, status):
+        pass
+
+
+# --------------------------------------------------------------------------
+# Notifications
+
+
+class Notifier:
+    def __init__(self, session):
+        self.session = session
+        self.ids = {}  # device key -> notification id, so updates replace in place
+
+    def _iface(self):
+        obj = self.session.get_object("org.freedesktop.Notifications",
+                                      "/org/freedesktop/Notifications")
+        return dbus.Interface(obj, "org.freedesktop.Notifications")
+
+    def low(self, dev, critical):
+        # Same shape as GNOME's own low-battery warnings for peripherals.
+        if critical:
+            summary = f"{dev.kind} battery critically low"
+        else:
+            summary = f"{dev.kind} battery low"
+        body = f"{dev.name} is low on power ({dev.percent}%)"
+        hints = dbus.Dictionary({
+            "urgency": dbus.Byte(2 if critical else 1),
+            "category": "device",
+            "desktop-entry": APP_ID,
+        }, signature="sv")
+        icon = "battery-empty-symbolic" if critical else "battery-caution-symbolic"
+        try:
+            nid = self._iface().Notify(APP_NAME, dbus.UInt32(self.ids.get(dev.key, 0)),
+                                       icon, summary, body, dbus.Array([], signature="s"),
+                                       hints, dbus.Int32(-1))
+            self.ids[dev.key] = int(nid)
+        except dbus.DBusException as e:
+            print(f"notify: {e}", file=sys.stderr)
+
+    def clear(self, key):
+        nid = self.ids.pop(key, None)
+        if nid:
+            try:
+                self._iface().CloseNotification(dbus.UInt32(nid))
+            except dbus.DBusException:
+                pass
+
+
+# --------------------------------------------------------------------------
+# Main application
+
+
+class App:
+    def __init__(self, args):
+        self.args = args
+        self.loop = GLib.MainLoop()
+        self.system = dbus.SystemBus()
+        self.session = dbus.SessionBus()
+        self.notifier = Notifier(self.session)
+        self.devices = {}  # UPower path -> Device
+        self.trays = {}  # UPower path -> TrayItem
+        self.alerted = {}  # device key -> lowest level already alerted for
+        self.trends = {}  # device key -> [low, high, charging] for inference
+
+        for sig in ("DeviceAdded", "DeviceRemoved"):
+            self.system.add_signal_receiver(lambda *_: self.sync(), sig, UPOWER,
+                                            UPOWER, UPOWER_PATH)
+        self.system.add_signal_receiver(self._on_props, "PropertiesChanged", PROPS,
+                                        UPOWER, path_keyword="path")
+
+    def _on_props(self, iface, changed, invalidated, path=None):
+        if iface == UPOWER_DEVICE and path != UPOWER_PATH:
+            self.sync()
+
+    def read_devices(self):
+        upower = self.system.get_object(UPOWER, UPOWER_PATH)
+        devices = {}
+        for path in upower.EnumerateDevices(dbus_interface=UPOWER):
+            obj = self.system.get_object(UPOWER, path)
+            try:
+                dev = Device(path, obj.GetAll(UPOWER_DEVICE, dbus_interface=PROPS))
+            except dbus.DBusException:
+                continue
+            if not dev.present or not dev.is_peripheral():
+                continue
+            if self.args.all_peripherals or dev.is_bluetooth():
+                devices[dev.path] = dev
+        return devices
+
+    def sorted_devices(self):
+        return sorted(self.devices.values(), key=lambda d: (d.kind, d.name))
+
+    def sync(self):
+        try:
+            self.devices = self.read_devices()
+        except dbus.DBusException as e:
+            print(f"upower: {e}", file=sys.stderr)
+            return True
+        for dev in self.devices.values():
+            self.infer_charging(dev)
+
+        if not self.args.no_tray:
+            for path in list(self.trays):
+                if path not in self.devices:
+                    self.trays.pop(path).close()
+            for path, dev in self.devices.items():
+                if path in self.trays:
+                    self.trays[path].update(dev)
+                else:
+                    self.trays[path] = TrayItem(self, dev)
+
+        for dev in self.devices.values():
+            self.check_alert(dev)
+        return True  # keep the periodic timer running
+
+    def infer_charging(self, dev):
+        if dev.state_known:
+            self.trends.pop(dev.key, None)
+            return
+        p = dev.percent
+        trend = self.trends.setdefault(dev.key, [p, p, False])
+        low, high, charging = trend
+        if charging:
+            high = max(high, p)
+            if p <= high - TREND_MARGIN:
+                low, charging = p, False
+        else:
+            low = min(low, p)
+            if p >= low + TREND_MARGIN:
+                high, charging = p, True
+        trend[:] = [low, high, charging]
+        dev.inferred_charging = charging
+
+    def check_alert(self, dev):
+        a = self.args
+        if dev.charging or dev.percent >= a.threshold + REARM_MARGIN:
+            if self.alerted.pop(dev.key, None) is not None:
+                self.notifier.clear(dev.key)
+            return
+        if dev.percent > a.threshold:
+            return
+        level = a.critical if dev.percent <= a.critical else a.threshold
+        if level < self.alerted.get(dev.key, 101):
+            self.alerted[dev.key] = level
+            print(f"alert: {dev.summary()}", flush=True)
+            self.notifier.low(dev, critical=level == a.critical)
+
+    def quit(self):
+        self.loop.quit()
+        return False
+
+    def run(self):
+        self.sync()
+        GLib.timeout_add_seconds(self.args.interval, self.sync)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
+        self.loop.run()
+        for tray in self.trays.values():
+            tray.close()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("-t", "--threshold", type=int, default=40,
+                   help="alert when a device is at or below this %% (default 40)")
+    p.add_argument("-c", "--critical", type=int, default=10,
+                   help="send a second, critical alert at or below this %% (default 10)")
+    p.add_argument("-i", "--interval", type=int, default=60,
+                   help="seconds between full re-reads, on top of UPower signals (default 60)")
+    p.add_argument("--no-tray", action="store_true", help="notifications only, no tray icons")
+    p.add_argument("--all-peripherals", action="store_true",
+                   help="include non-Bluetooth peripherals (e.g. USB wireless receivers)")
+    p.add_argument("-l", "--list", action="store_true", help="print battery levels and exit")
+    args = p.parse_args()
+    if not 0 <= args.critical <= args.threshold <= 100:
+        p.error("need 0 <= --critical <= --threshold <= 100")
+
+    DBusGMainLoop(set_as_default=True)
+    app = App(args)
+    if args.list:
+        devices = app.read_devices()
+        for dev in sorted(devices.values(), key=lambda d: (d.kind, d.name)):
+            print(f"{dev.kind:<16} {dev.summary()}")
+        if not devices:
+            print("no Bluetooth batteries reported by UPower")
+        return
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

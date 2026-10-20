@@ -1,0 +1,12 @@
+[Unit]
+Description=Bluetooth battery alerts and tray icons
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/bt-battery-alert
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

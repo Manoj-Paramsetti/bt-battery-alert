@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Bluetooth Battery
+Comment=Low-battery alerts and tray levels for Bluetooth devices
+Exec=bt-battery-alert
+Icon=battery-caution-symbolic
+Categories=Utility;System;
+NoDisplay=true
+X-GNOME-UsesNotifications=true
