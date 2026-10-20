@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Bluetooth battery alerts and tray icons for Linux desktops.
 
-Reads battery levels of Bluetooth devices from UPower, shows one tray icon per
-device (StatusNotifierItem, drawn with the charge level), and sends a
-low-battery notification when a device drops to the alert threshold.
+Reads battery levels of Bluetooth devices from UPower, shows them all in one
+tray icon (StatusNotifierItem: a glyph and charge number per device), and
+sends a low-battery notification when a device drops to the alert threshold.
 """
 
 import argparse
+import os
 import re
 import signal
 import sys
@@ -104,66 +105,142 @@ def level_color(percent, threshold, critical, charging):
     return (0.30, 0.80, 0.40)
 
 
-def render_icon(size, percent, color):
-    """Draw the charge number above a small battery gauge, return ARGB32 bytes."""
-    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+# Glyph per device kind; anything else gets the Bluetooth rune.
+GLYPHS = {
+    "Mouse": "mouse", "Touchpad": "mouse", "Keyboard": "keyboard",
+    "Headset": "headphones", "Headphones": "headphones", "Speakers": "headphones",
+}
+
+
+def glyph_path(cr, glyph, s):
+    """Trace a device glyph on a 24-unit grid; draw_glyph scales it to fit."""
+    if glyph == "mouse":
+        rounded_rect(cr, 8 * s, 1 * s, 8 * s, 12.5 * s, 4 * s)
+        cr.move_to(12 * s, 1 * s)
+        cr.line_to(12 * s, 5.5 * s)
+    elif glyph == "keyboard":
+        rounded_rect(cr, 1.5 * s, 3 * s, 21 * s, 10 * s, 1.5 * s)
+        for row, y in enumerate((6, 8.5)):
+            for x in range(5 + row, 20, 3):
+                cr.move_to(x * s, y * s)
+                cr.line_to((x + 0.5) * s, y * s)
+        cr.move_to(7.5 * s, 11 * s)
+        cr.line_to(16.5 * s, 11 * s)
+    elif glyph == "headphones":
+        cr.arc(12 * s, 9 * s, 7.5 * s, 3.1416, 0)
+        rounded_rect(cr, 3 * s, 8 * s, 4 * s, 5.5 * s, 1 * s)
+        rounded_rect(cr, 17 * s, 8 * s, 4 * s, 5.5 * s, 1 * s)
+    else:
+        cr.move_to(8 * s, 4 * s)
+        cr.line_to(16 * s, 10 * s)
+        cr.line_to(12 * s, 13 * s)
+        cr.line_to(12 * s, 1 * s)
+        cr.line_to(16 * s, 4 * s)
+        cr.line_to(8 * s, 10 * s)
+
+
+def rounded_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -1.5708, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+    cr.close_path()
+
+
+def glyph_extents(glyph):
+    cr = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+    glyph_path(cr, glyph, 1)
+    return cr.path_extents()
+
+
+def draw_glyph(cr, glyph, box, s, rgb):
+    """Scale the glyph to fit `box` (x, y, w, h) and stroke it in `rgb` over a
+    dark halo, so it reads on any panel."""
+    bx, by, bw, bh = box
+    x0, y0, x1, y1 = glyph_extents(glyph)
+    k = min(bw / (x1 - x0), bh / (y1 - y0))
+    cr.save()
+    cr.translate(bx + bw / 2 - k * (x0 + x1) / 2, by + bh / 2 - k * (y0 + y1) / 2)
+    cr.scale(k, k)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    unit = s / k  # one icon unit in glyph coordinates
+    for rgba, width in (((0, 0, 0, 0.55), 3.6), ((*rgb, 1), 1.8)):
+        glyph_path(cr, glyph, 1)
+        cr.set_source_rgba(*rgba)
+        cr.set_line_width(max(1.0 / k, width * unit))
+        cr.stroke()
+    cr.restore()
+
+
+def render_entry(h, glyph, text, rgb):
+    """Draw one glyph and its charge number; return the surface and the
+    first and last+1 columns that have ink."""
+    s = h / 24.0
+    gh = 0.86 * h
+    x0, y0, x1, y1 = glyph_extents(glyph)
+    gw = (x1 - x0) * min(1.5 * h / (x1 - x0), gh / (y1 - y0))  # wide glyphs capped
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(5 * h), h)
     cr = cairo.Context(surf)
-    s = size / 24.0
-
-    # Percentage text, shrunk to fit the icon width.
-    text = str(percent)
-    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-    cr.set_font_size(13 * s)
-    ext = cr.text_extents(text)
-    if ext.width > 23 * s:
-        cr.set_font_size(13 * s * 23 * s / ext.width)
+    x = 0.5 * h  # leave room for the halo on the left
+    draw_glyph(cr, glyph, (x, (h - gh) / 2, gw, gh), s, rgb)
+    if text:
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(0.95 * h)
         ext = cr.text_extents(text)
-    x = (size - ext.width) / 2 - ext.x_bearing
-    y = 13 * s - (ext.height + ext.y_bearing)
-    cr.move_to(x, y)
-    cr.text_path(text)
-    cr.set_source_rgba(0, 0, 0, 0.55)
-    cr.set_line_width(2 * s)
-    cr.stroke_preserve()
-    cr.set_source_rgb(1, 1, 1)
-    cr.fill()
-
-    # Battery gauge: outline, nub, and a fill proportional to the charge.
-    lw = max(1.0, 1.2 * s)
-    bx, by, bw, bh = 1.5 * s, 15 * s, 19 * s, 8 * s
-    cr.set_line_width(lw)
-    cr.rectangle(bx, by, bw, bh)
-    cr.set_source_rgb(1, 1, 1)
-    cr.stroke()
-    cr.rectangle(bx + bw, by + bh * 0.28, 2 * s, bh * 0.44)
-    cr.fill()
-    inner = bw - 2 * lw
-    fill = max(inner * min(percent, 100) / 100.0, lw)
-    cr.rectangle(bx + lw, by + lw, fill, bh - 2 * lw)
-    cr.set_source_rgb(*color)
-    cr.fill()
-
+        cr.move_to(x + gw + 0.22 * h - ext.x_bearing, h / 2 - (ext.y_bearing + ext.height / 2))
+        cr.text_path(text)
+        cr.set_source_rgba(0, 0, 0, 0.55)
+        cr.set_line_width(2 * s)
+        cr.stroke_preserve()
+        cr.set_source_rgb(*rgb)
+        cr.fill()
     surf.flush()
-    return to_network_argb(surf.get_data(), surf.get_stride(), size)
+    data, stride = surf.get_data(), surf.get_stride()
+    alpha = 3 if sys.byteorder == "little" else 0
+    inked = [c for c in range(surf.get_width())
+             if any(data[y * stride + c * 4 + alpha] for y in range(h))]
+    return surf, inked[0], inked[-1] + 1
 
 
-def to_network_argb(data, stride, size):
-    """Cairo gives native-endian premultiplied ARGB; SNI wants big-endian straight ARGB."""
-    little = sys.byteorder == "little"
-    out = bytearray(size * size * 4)
-    o = 0
-    for row in range(size):
-        base = row * stride
-        for i in range(base, base + size * 4, 4):
-            if little:
-                b, g, r, a = data[i], data[i + 1], data[i + 2], data[i + 3]
-            else:
-                a, r, g, b = data[i], data[i + 1], data[i + 2], data[i + 3]
-            if 0 < a < 255:
-                r, g, b = (min(255, c * 255 // a) for c in (r, g, b))
-            out[o:o + 4] = bytes((a, r, g, b))
-            o += 4
-    return bytes(out)
+def render_strip(height, entries):
+    """Draw every device as its glyph followed by its charge number, side by
+    side with a faint divider between devices, `height` pixels tall.
+    `entries` holds (glyph, percent, rgb) tuples; rgb None means white.
+    Returns a cairo surface."""
+    h = height
+    gap = round(0.6 * h)  # blank pixels on each side of a divider
+    entries = entries or [("bluetooth", None, None)]
+    # Measure each entry's actual ink, so the dividers sit exactly midway.
+    parts = [render_entry(h, glyph, "" if percent is None else str(percent), rgb or (1, 1, 1))
+             for glyph, percent, rgb in entries]
+    width = sum(r - l for _, l, r in parts) + (len(parts) - 1) * (2 * gap + 1)
+    pad = max(1, (int(1.5 * h + 0.5) - width + 1) // 2)
+
+    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width + 2 * pad, h)
+    cr = cairo.Context(surf)
+    x = pad
+    for n, (part, left, right) in enumerate(parts):
+        if n:
+            cr.rectangle(x + gap, round(0.2 * h), 1, round(0.6 * h))
+            cr.set_source_rgba(1, 1, 1, 0.3)
+            cr.fill()
+            x += 2 * gap + 1
+        cr.set_source_surface(part, x - left, 0)
+        cr.rectangle(x, 0, right - left, h)
+        cr.fill()
+        x += right - left
+    surf.flush()
+    return surf
+
+
+def remove_file(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return False  # one-shot when used as a GLib timeout
 
 
 # --------------------------------------------------------------------------
@@ -264,18 +341,23 @@ class Menu(dbus.service.Object):
 
 
 class TrayItem(dbus.service.Object):
-    """One tray icon. Each lives on its own private session-bus connection,
-    because the SNI convention fixes the object path to /StatusNotifierItem."""
+    """The tray icon: every device's glyph and charge, side by side.
 
-    SIZES = (16, 22, 24, 32, 48, 64)
+    The image goes out as a PNG file named in IconName rather than as
+    IconPixmap, because GNOME's AppIndicator extension squeezes pixmaps into a
+    square but shows a wide image file at its own size."""
 
-    def __init__(self, app, dev):
+    HEIGHT = 16  # GNOME's panel icon size
+
+    def __init__(self, app):
         self.conn = dbus.SessionBus(private=True)
         super().__init__(self.conn, "/StatusNotifierItem")
         self.app = app
         self.menu = Menu(self.conn, app)
-        self.dev = dev
-        self.pixmaps = dbus.Array([], signature="(iiay)")
+        self.icon_dir = os.path.join(GLib.get_user_runtime_dir(), APP_ID)
+        self.icon_file = ""
+        self.serial = 0
+        self.shown = None  # entries the current image shows
         self._render()
         self._watch = self.conn.watch_name_owner(SNW, self._on_watcher)
 
@@ -289,19 +371,29 @@ class TrayItem(dbus.service.Object):
             error_handler=lambda e: print(f"tray: register failed: {e}", file=sys.stderr))
 
     def _render(self):
+        """Redraw the image if what it shows changed; return whether it did."""
         a = self.app.args
-        color = level_color(self.dev.percent, a.threshold, a.critical, self.dev.charging)
-        self.pixmaps = dbus.Array(
-            [dbus.Struct((dbus.Int32(n), dbus.Int32(n),
-                          dbus.ByteArray(render_icon(n, self.dev.percent, color))),
-                         signature="iiay")
-             for n in self.SIZES],
-            signature="(iiay)")
+        entries = []
+        for dev in self.app.sorted_devices():
+            color = level_color(dev.percent, a.threshold, a.critical, dev.charging)
+            if color == level_color(100, 0, 0, False):
+                color = None  # healthy devices stay white; only warnings are tinted
+            entries.append((GLYPHS.get(dev.kind, "bluetooth"), dev.percent, color))
+        if entries == self.shown:
+            return False
+        self.shown = entries
+        # A fresh name every time, since the shell caches images by file.
+        os.makedirs(self.icon_dir, exist_ok=True)
+        self.serial += 1
+        path = os.path.join(self.icon_dir, f"tray-{os.getpid()}-{self.serial}.png")
+        render_strip(self.HEIGHT, entries).write_to_png(path)
+        old, self.icon_file = self.icon_file, path
+        if old:
+            GLib.timeout_add_seconds(10, remove_file, old)
+        return True
 
-    def update(self, dev):
-        old, self.dev = self.dev, dev
-        if (old.percent, old.charging) != (dev.percent, dev.charging):
-            self._render()
+    def update(self):
+        if self._render():
             self.NewIcon()
         self.NewTitle()
         self.NewToolTip()
@@ -313,31 +405,33 @@ class TrayItem(dbus.service.Object):
         self.menu.remove_from_connection()
         self.remove_from_connection()
         self.conn.close()
+        remove_file(self.icon_file)
 
     def _status(self):
-        low = not self.dev.charging and self.dev.percent <= self.app.args.threshold
+        t = self.app.args.threshold
+        low = any(not d.charging and d.percent <= t for d in self.app.devices.values())
         return "NeedsAttention" if low else "Active"
 
     def _props(self):
-        dev = self.dev
         no_pixmap = dbus.Array([], signature="(iiay)")
-        body = f"{dev.kind} · {dev.percent}%" + (" · charging" if dev.charging else "")
+        devices = self.app.sorted_devices()
+        body = "\n".join(f"{d.kind} — {d.summary()}" for d in devices) or "No Bluetooth batteries"
         return dbus.Dictionary({
             "Category": "Hardware",
-            "Id": f"{APP_ID}-{dev.key}",
-            "Title": dev.summary(),
+            "Id": APP_ID,
+            "Title": APP_NAME,
             "Status": self._status(),
             "WindowId": dbus.Int32(0),
-            "IconName": "",
-            "IconPixmap": self.pixmaps,
-            "AttentionIconName": "",
-            "AttentionIconPixmap": self.pixmaps,
+            "IconName": self.icon_file,
+            "IconPixmap": no_pixmap,
+            "AttentionIconName": self.icon_file,
+            "AttentionIconPixmap": no_pixmap,
             "OverlayIconName": "",
             "OverlayIconPixmap": no_pixmap,
             "IconThemePath": "",
             "ItemIsMenu": True,
             "Menu": dbus.ObjectPath("/MenuBar"),
-            "ToolTip": dbus.Struct(("", no_pixmap, dev.name, body), signature="sa(iiay)ss"),
+            "ToolTip": dbus.Struct(("", no_pixmap, APP_NAME, body), signature="sa(iiay)ss"),
         }, signature="sv")
 
     @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
@@ -441,7 +535,7 @@ class App:
         self.session = dbus.SessionBus()
         self.notifier = Notifier(self.session)
         self.devices = {}  # UPower path -> Device
-        self.trays = {}  # UPower path -> TrayItem
+        self.tray = None
         self.alerted = {}  # device key -> lowest level already alerted for
         self.trends = {}  # device key -> [low, high, charging] for inference
 
@@ -482,15 +576,12 @@ class App:
         for dev in self.devices.values():
             self.infer_charging(dev)
 
-        if not self.args.no_tray:
-            for path in list(self.trays):
-                if path not in self.devices:
-                    self.trays.pop(path).close()
-            for path, dev in self.devices.items():
-                if path in self.trays:
-                    self.trays[path].update(dev)
-                else:
-                    self.trays[path] = TrayItem(self, dev)
+        if self.args.no_tray:
+            pass
+        elif self.tray:
+            self.tray.update()
+        else:
+            self.tray = TrayItem(self)
 
         for dev in self.devices.values():
             self.check_alert(dev)
@@ -538,8 +629,8 @@ class App:
         for sig in (signal.SIGINT, signal.SIGTERM):
             unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
         self.loop.run()
-        for tray in self.trays.values():
-            tray.close()
+        if self.tray:
+            self.tray.close()
 
 
 def main():
