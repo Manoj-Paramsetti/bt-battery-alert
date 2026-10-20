@@ -2,7 +2,7 @@
 
 Low-battery notifications and tray icons for Bluetooth devices on Linux.
 
-![Tray icon showing a headset at 90%, a keyboard at 85% and a mouse at 74%, with its menu open](screenshot.png)
+<img src="screenshot.png" width="410" alt="Tray icon showing a headset at 100%, a keyboard at 87% and a mouse at 74%, with its menu open">
 
 - One wide tray icon for all your Bluetooth devices, side by side: the
   Adwaita icon for each device type (mouse, keyboard, headset, headphones,
