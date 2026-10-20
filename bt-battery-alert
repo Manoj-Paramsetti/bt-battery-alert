@@ -2,21 +2,26 @@
 """Bluetooth battery alerts and tray icons for Linux desktops.
 
 Reads battery levels of Bluetooth devices from UPower, shows them all in one
-tray icon (StatusNotifierItem: a glyph and charge number per device), and
+tray icon (StatusNotifierItem: an icon and charge number per device), and
 sends a low-battery notification when a device drops to the alert threshold.
 """
 
 import argparse
+import math
 import os
 import re
 import signal
 import sys
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import quoteattr
 
-import cairo
 import dbus
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
+import gi
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import GLib, Pango, PangoCairo
 
 try:
     from gi.repository import GLibUnix
@@ -112,134 +117,110 @@ def level_color(percent, threshold, critical, charging):
     return None
 
 
-# Glyph per device kind; anything else gets the Bluetooth rune.
-GLYPHS = {
-    "Mouse": "mouse", "Touchpad": "mouse", "Keyboard": "keyboard",
-    "Headset": "headphones", "Headphones": "headphones", "Speakers": "headphones",
+# Adwaita symbolic icon per device kind, the same ones GNOME's panel uses.
+ICONS = {
+    "Mouse": "input-mouse", "Touchpad": "input-touchpad", "Keyboard": "input-keyboard",
+    "Headset": "audio-headset", "Headphones": "audio-headphones",
+    "Speakers": "audio-speakers", "Game controller": "input-gaming", "Phone": "phone",
 }
+DEFAULT_ICON = "bluetooth-active"
+WHITE = (1, 1, 1)
 
 
-def glyph_path(cr, glyph, s):
-    """Trace a device glyph on a 24-unit grid; draw_glyph scales it to fit."""
-    if glyph == "mouse":
-        rounded_rect(cr, 8 * s, 1 * s, 8 * s, 12.5 * s, 4 * s)
-        cr.move_to(12 * s, 1 * s)
-        cr.line_to(12 * s, 5.5 * s)
-    elif glyph == "keyboard":
-        rounded_rect(cr, 1.5 * s, 3 * s, 21 * s, 10 * s, 1.5 * s)
-        for row, y in enumerate((6, 8.5)):
-            for x in range(5 + row, 20, 3):
-                cr.move_to(x * s, y * s)
-                cr.line_to((x + 0.5) * s, y * s)
-        cr.move_to(7.5 * s, 11 * s)
-        cr.line_to(16.5 * s, 11 * s)
-    elif glyph == "headphones":
-        cr.arc(12 * s, 9 * s, 7.5 * s, 3.1416, 0)
-        rounded_rect(cr, 3 * s, 8 * s, 4 * s, 5.5 * s, 1 * s)
-        rounded_rect(cr, 17 * s, 8 * s, 4 * s, 5.5 * s, 1 * s)
-    else:
-        cr.move_to(8 * s, 4 * s)
-        cr.line_to(16 * s, 10 * s)
-        cr.line_to(12 * s, 13 * s)
-        cr.line_to(12 * s, 1 * s)
-        cr.line_to(16 * s, 4 * s)
-        cr.line_to(8 * s, 10 * s)
+def find_icon(name):
+    """Path of an Adwaita symbolic icon, or None."""
+    dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    for d in dirs.split(":"):
+        base = os.path.join(d, "icons", "Adwaita", "symbolic")
+        if not os.path.isdir(base):
+            continue
+        for context in os.listdir(base):
+            path = os.path.join(base, context, f"{name}-symbolic.svg")
+            if os.path.exists(path):
+                return path
+    return None
 
 
-def rounded_rect(cr, x, y, w, h, r):
-    cr.new_sub_path()
-    cr.arc(x + w - r, y + r, r, -1.5708, 0)
-    cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
-    cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
-    cr.arc(x + r, y + r, r, 3.1416, 4.7124)
-    cr.close_path()
+def panel_font():
+    """The interface font in bold at its pixel size, as GNOME's top bar
+    shows it."""
+    name, scale = "Sans 10", 1.0
+    try:
+        from gi.repository import Gio
+        settings = Gio.Settings.new("org.gnome.desktop.interface")
+        name = settings.get_string("font-name") or name
+        scale = settings.get_double("text-scaling-factor") or scale
+    except Exception:  # not GNOME, or schema missing
+        pass
+    desc = Pango.FontDescription.from_string(name)
+    size = desc.get_size() / Pango.SCALE
+    if not desc.get_size_is_absolute():
+        size *= 96 / 72  # points to pixels
+    desc.set_weight(Pango.Weight.BOLD)
+    desc.set_absolute_size(size * scale * Pango.SCALE)
+    return desc
 
 
-def glyph_extents(glyph):
-    cr = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
-    glyph_path(cr, glyph, 1)
-    return cr.path_extents()
+def hex_color(rgb):
+    return "#" + "".join(f"{round(c * 255):02x}" for c in rgb)
 
 
-def draw_glyph(cr, glyph, box, s, rgb):
-    """Scale the glyph to fit `box` (x, y, w, h) and stroke it in `rgb` over a
-    dark halo, so it reads on any panel."""
-    bx, by, bw, bh = box
-    x0, y0, x1, y1 = glyph_extents(glyph)
-    k = min(bw / (x1 - x0), bh / (y1 - y0))
-    cr.save()
-    cr.translate(bx + bw / 2 - k * (x0 + x1) / 2, by + bh / 2 - k * (y0 + y1) / 2)
-    cr.scale(k, k)
-    cr.set_line_cap(cairo.LINE_CAP_ROUND)
-    cr.set_line_join(cairo.LINE_JOIN_ROUND)
-    unit = s / k  # one icon unit in glyph coordinates
-    for rgba, width in (((0, 0, 0, 0.55), 3.6), ((*rgb, 1), 1.8)):
-        glyph_path(cr, glyph, 1)
-        cr.set_source_rgba(*rgba)
-        cr.set_line_width(max(1.0 / k, width * unit))
-        cr.stroke()
-    cr.restore()
-
-
-def render_entry(h, glyph, text, rgb):
-    """Draw one glyph and its charge number; return the surface and the
-    first and last+1 columns that have ink."""
-    s = h / 24.0
-    gh = 0.86 * h
-    x0, y0, x1, y1 = glyph_extents(glyph)
-    gw = (x1 - x0) * min(1.5 * h / (x1 - x0), gh / (y1 - y0))  # wide glyphs capped
-    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(5 * h), h)
-    cr = cairo.Context(surf)
-    x = 0.5 * h  # leave room for the halo on the left
-    draw_glyph(cr, glyph, (x, (h - gh) / 2, gw, gh), s, rgb)
-    if text:
-        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        cr.set_font_size(0.95 * h)
-        ext = cr.text_extents(text)
-        cr.move_to(x + gw + 0.22 * h - ext.x_bearing, h / 2 - (ext.y_bearing + ext.height / 2))
-        cr.text_path(text)
-        cr.set_source_rgba(0, 0, 0, 0.55)
-        cr.set_line_width(2 * s)
-        cr.stroke_preserve()
-        cr.set_source_rgb(*rgb)
-        cr.fill()
-    surf.flush()
-    data, stride = surf.get_data(), surf.get_stride()
-    alpha = 3 if sys.byteorder == "little" else 0
-    inked = [c for c in range(surf.get_width())
-             if any(data[y * stride + c * 4 + alpha] for y in range(h))]
-    return surf, inked[0], inked[-1] + 1
+def icon_svg(name, x, size, rgb):
+    """An Adwaita symbolic icon's shapes, recoloured and placed at (x, 0)."""
+    path = find_icon(name) or find_icon(DEFAULT_ICON)
+    if not path:
+        return ""
+    root = ET.parse(path).getroot()
+    for el in root.iter():
+        el.tag = el.tag.split("}")[-1]  # drop the namespace; the strip declares it
+        if el.get("fill") not in (None, "none"):
+            el.set("fill", hex_color(rgb))  # fill-opacity stays: it dims parts
+    shapes = "".join(ET.tostring(child, encoding="unicode") for child in root)
+    return f'<g transform="translate({x:g} 0) scale({size / 16:g})">{shapes}</g>'
 
 
 def render_strip(height, entries):
-    """Draw every device as its glyph followed by its charge number, side by
-    side with a faint divider between devices, `height` pixels tall.
-    `entries` holds (glyph, percent, rgb) tuples; rgb None means white.
-    Returns a cairo surface."""
-    h = height
-    gap = round(0.6 * h)  # blank pixels on each side of a divider
-    entries = entries or [("bluetooth", None, None)]
-    # Measure each entry's actual ink, so the dividers sit exactly midway.
-    parts = [render_entry(h, glyph, "" if percent is None else str(percent), rgb or (1, 1, 1))
-             for glyph, percent, rgb in entries]
-    width = sum(r - l for _, l, r in parts) + (len(parts) - 1) * (2 * gap + 1)
-    pad = max(1, (int(1.5 * h + 0.5) - width + 1) // 2)
+    """Draw every device as its icon followed by its charge number, side by
+    side with a faint divider between devices, `height` units tall.
 
-    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, width + 2 * pad, h)
-    cr = cairo.Context(surf)
-    x = pad
-    for n, (part, left, right) in enumerate(parts):
+    Returns SVG rather than pixels, so the shell rasterises it at the screen's
+    real resolution; a bitmap gets stretched on HiDPI screens. `entries` holds
+    (icon name, percent, rgb) tuples; rgb None means white."""
+    h = height
+    inner, gap = 0.25 * h, 0.6 * h  # icon-to-number, around dividers
+    entries = entries or [(DEFAULT_ICON, None, None)]
+    desc = panel_font()
+    family = desc.get_family()
+    px = desc.get_size() / Pango.SCALE
+    layout = Pango.Layout.new(PangoCairo.FontMap.get_default().create_context())
+    layout.set_font_description(desc)
+
+    body, x = [], 0.0
+    for n, (icon, percent, rgb) in enumerate(entries):
         if n:
-            cr.rectangle(x + gap, round(0.2 * h), 1, round(0.6 * h))
-            cr.set_source_rgba(1, 1, 1, 0.3)
-            cr.fill()
+            body.append(f'<rect x="{x + gap:g}" y="{0.25 * h:g}" width="1" '
+                        f'height="{0.5 * h:g}" fill="#ffffff" fill-opacity="0.3"/>')
             x += 2 * gap + 1
-        cr.set_source_surface(part, x - left, 0)
-        cr.rectangle(x, 0, right - left, h)
-        cr.fill()
-        x += right - left
-    surf.flush()
-    return surf
+        rgb = rgb or WHITE
+        body.append(icon_svg(icon, x, h, rgb))
+        x += h
+        if percent is None:
+            continue
+        # Measure the digits' ink, so they sit exactly `inner` from the icon
+        # and centred on its height.
+        layout.set_text(str(percent), -1)
+        ink = layout.get_extents()[0]
+        ix, iy = ink.x / Pango.SCALE, ink.y / Pango.SCALE
+        iw, ih = ink.width / Pango.SCALE, ink.height / Pango.SCALE
+        baseline = layout.get_baseline() / Pango.SCALE
+        body.append(
+            f'<text x="{x + inner - ix:g}" y="{(h - ih) / 2 - iy + baseline:g}" '
+            f'font-family={quoteattr(family)} font-weight="bold" font-size="{px:g}px" '
+            f'fill="{hex_color(rgb)}">{percent}</text>')
+        x += inner + iw
+    width = math.ceil(max(x, 1.5 * h))  # at least 1.5:1, so the shell keeps it wide
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{h}" '
+            f'viewBox="0 0 {width} {h}">{"".join(body)}</svg>')
 
 
 def remove_file(path):
@@ -348,9 +329,9 @@ class Menu(dbus.service.Object):
 
 
 class TrayItem(dbus.service.Object):
-    """The tray icon: every device's glyph and charge, side by side.
+    """The tray icon: every device's icon and charge, side by side.
 
-    The image goes out as a PNG file named in IconName rather than as
+    The image goes out as an SVG file named in IconName rather than as
     IconPixmap, because GNOME's AppIndicator extension squeezes pixmaps into a
     square but shows a wide image file at its own size."""
 
@@ -383,15 +364,16 @@ class TrayItem(dbus.service.Object):
         entries = []
         for dev in self.app.sorted_devices():
             color = level_color(dev.percent, a.threshold, a.critical, dev.charging)
-            entries.append((GLYPHS.get(dev.kind, "bluetooth"), dev.percent, color))
+            entries.append((ICONS.get(dev.kind, DEFAULT_ICON), dev.percent, color))
         if entries == self.shown:
             return False
         self.shown = entries
         # A fresh name every time, since the shell caches images by file.
         os.makedirs(self.icon_dir, exist_ok=True)
         self.serial += 1
-        path = os.path.join(self.icon_dir, f"tray-{os.getpid()}-{self.serial}.png")
-        render_strip(self.HEIGHT, entries).write_to_png(path)
+        path = os.path.join(self.icon_dir, f"tray-{os.getpid()}-{self.serial}.svg")
+        with open(path, "w") as f:
+            f.write(render_strip(self.HEIGHT, entries))
         old, self.icon_file = self.icon_file, path
         if old:
             GLib.timeout_add_seconds(10, remove_file, old)
